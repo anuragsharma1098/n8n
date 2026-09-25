@@ -5,7 +5,7 @@
 | n8n | http://localhost:5678 | The workflow editor. The first time you open it, create the owner account. |
 | Adminer | http://localhost:8080 | A web UI for the Postgres database where n8n stores its data. |
 
-The containers are n8n, Postgres, Adminer, and `n8n-runners`, which runs Code nodes. Only this PC can reach them. They're only up while Docker Desktop is running, and they start automatically whenever Docker Desktop starts.
+The containers are n8n, Postgres, Adminer, and `n8n-runners`, which runs Code nodes. Only this PC can reach them. They run only while Docker Desktop is running. If they were running when Docker Desktop quit, they start again with it; after `docker compose stop` or `down`, start them with `docker compose up -d`. Docker Desktop itself only starts at sign-in if **Start Docker Desktop when you sign in to your computer** is on in its settings.
 
 ## First-time setup
 
@@ -24,13 +24,13 @@ Run these in PowerShell from this folder.
 | Start (also after `stop` or `down`) | `docker compose up -d` |
 | Stop (keeps the containers) | `docker compose stop` |
 | Stop and remove the containers | `docker compose down` |
-| Follow n8n logs | `docker compose logs -f n8n` |
+| Follow n8n logs (Ctrl+C to stop) | `docker compose logs -f n8n` |
 | Update | For a newer n8n, first change `N8N_VERSION` in `.env`. Then `docker compose pull`, then `docker compose up -d` |
 
 None of these commands delete your data. It lives in two Docker volumes:
 
 - `n8n_postgres_data`: the Postgres database with your workflows, credentials and execution history.
-- `n8n_data`: n8n's encryption key. Without it, the credentials saved in the database can't be decrypted.
+- `n8n_data`: n8n's encryption key, plus files your workflows handle and any community nodes you install. Without the key, the credentials saved in the database can't be decrypted.
 
 `docker compose down -v` deletes both volumes, so only add `-v` when you mean to wipe n8n.
 
@@ -64,7 +64,7 @@ Claude can't see workflows you build in the editor until you expose them: use **
 
 ## Backup
 
-Stops everything for a few seconds and saves the database and the encryption key to `backups\n8n-backup-<date>.tar.gz`:
+Stops n8n for about half a minute and saves the database and the encryption key to `backups\n8n-backup-<date>.tar.gz`:
 
 ```powershell
 docker compose stop
@@ -91,7 +91,7 @@ Edit `docker-compose.yml`, then run `docker compose up -d` to apply.
 
 - **Open n8n from other devices on your network:** change the n8n port line to `"5678:5678"` and add `N8N_SECURE_COOKIE=false` under its `environment` (needed because the connection is plain http). Then browse to `http://<this PC's IP>:5678`.
 - **Receive webhooks from the internet:** run a tunnel (ngrok, Cloudflare Tunnel) and set `N8N_WEBHOOK_URL` to its public URL.
-- **Postgres login in `.env`:** don't change these values after the first start. They only apply when the database is created, so n8n would lose its connection.
+- **Postgres login in `.env`:** these values only take effect when the database is first created, so changing them later breaks n8n's connection. To change the password, first run `ALTER USER n8n WITH PASSWORD 'new-password';` in Adminer (**SQL command**), then put the same value in `.env` and run `docker compose up -d`.
 
 ## Code nodes
 

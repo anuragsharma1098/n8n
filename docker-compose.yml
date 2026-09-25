@@ -24,7 +24,7 @@ services:
     container_name: n8n
     restart: unless-stopped
     ports:
-      # Reachable only from this PC. Use "5678:5678" to expose it to your network.
+      # Reachable only from this PC. To open it to your network, see "Changing settings" in README.md.
       - "127.0.0.1:5678:5678"
     environment:
       - DB_TYPE=postgresdb

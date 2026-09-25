@@ -1,4 +1,4 @@
-# Postgres password
+# Secrets: Postgres password and task-runner token
 .env
 # Backups contain your credentials and encryption key
 backups/
