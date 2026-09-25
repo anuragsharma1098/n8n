@@ -21,12 +21,13 @@ Run these in PowerShell from this folder.
 
 | Task | Command |
 |---|---|
-| Start | `docker compose up -d` |
-| Stop | `docker compose down` |
+| Start (also after `stop` or `down`) | `docker compose up -d` |
+| Stop (keeps the containers) | `docker compose stop` |
+| Stop and remove the containers | `docker compose down` |
 | Follow n8n logs | `docker compose logs -f n8n` |
 | Update | For a newer n8n, first change `N8N_VERSION` in `.env`. Then `docker compose pull`, then `docker compose up -d` |
 
-Stopping and updating keep your data. It lives in two Docker volumes:
+None of these commands delete your data. It lives in two Docker volumes:
 
 - `n8n_postgres_data`: the Postgres database with your workflows, credentials and execution history.
 - `n8n_data`: n8n's encryption key. Without it, the credentials saved in the database can't be decrypted.
