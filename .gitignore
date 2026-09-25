@@ -1,0 +1,8 @@
+# Postgres password
+.env
+# Backups contain your credentials and encryption key
+backups/
+# Files your workflows read and write
+local-files/
+# Personal Claude Code settings
+.claude/settings.local.json
