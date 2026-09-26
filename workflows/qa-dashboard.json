@@ -1,0 +1,139 @@
+{
+  "id": "qaDashboard00001",
+  "name": "QA Quality Gate: dashboard",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## QA dashboard\n\n`GET /webhook/qa/dashboard` lists every project.\n`GET /webhook/qa/dashboard?project=org/repo&branch=main` shows one project: pass-rate trend, failing tests, unstable and flaky tests, slowest tests and recent runs.\n\nRead-only and unauthenticated, so browsers can open it. Keep n8n on localhost or behind your own login if the data is sensitive.",
+        "height": 260,
+        "width": 560,
+        "color": 5
+      },
+      "id": "ef7fcc57-c043-5b6d-8452-8eab96eed38e",
+      "name": "Sticky note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "qa/dashboard",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "e6fa50cb-85c1-5abc-adc7-6b70c730fa5e",
+      "name": "Open dashboard",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        240
+      ],
+      "webhookId": "f87d70f6-5b27-5603-b5f9-1b849e637298"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Everything the dashboard shows, in one query. $1 = project ('' for the project list), $2 = branch.\nWITH params AS (\n  SELECT NULLIF($1, '') AS project, COALESCE(NULLIF($2, ''), 'main') AS branch\n), projects AS (\n  SELECT project, branch, count(*)::int AS runs, max(created_at) AS last_run_at,\n         (array_agg(round(100.0 * passed / NULLIF(total - skipped, 0), 1) ORDER BY id DESC))[1] AS last_pass_rate,\n         (array_agg(failed ORDER BY id DESC))[1] AS last_failed\n  FROM test_runs\n  GROUP BY project, branch\n), runs AS (\n  SELECT r.id, r.commit_sha, r.build_url, r.total, r.passed, r.failed, r.skipped, r.duration_ms, r.created_at,\n         round(100.0 * r.passed / NULLIF(r.total - r.skipped, 0), 1) AS pass_rate\n  FROM test_runs r JOIN params p ON r.project = p.project AND r.branch = p.branch\n  ORDER BY r.id DESC\n  LIMIT 20\n), window_runs AS (\n  SELECT id FROM runs ORDER BY id DESC LIMIT 10\n), latest AS (\n  SELECT max(id) AS id FROM runs\n), history AS (\n  SELECT test_id, status, retried, lag(status) OVER (PARTITION BY test_id ORDER BY run_id) AS prev_status\n  FROM test_results\n  WHERE run_id IN (SELECT id FROM window_runs) AND status <> 'skipped'\n), unstable AS (\n  SELECT test_id,\n         count(*) FILTER (WHERE prev_status IS NOT NULL AND (prev_status = 'passed') <> (status = 'passed'))::int AS flips,\n         count(*) FILTER (WHERE status <> 'passed')::int AS failures,\n         count(*) FILTER (WHERE retried)::int AS passed_on_retry,\n         count(*)::int AS runs\n  FROM history\n  GROUP BY test_id\n)\nSELECT\n  (SELECT project FROM params) AS project,\n  (SELECT branch FROM params) AS branch,\n  COALESCE((SELECT json_agg(p ORDER BY p.last_run_at DESC) FROM projects p), '[]'::json) AS projects,\n  COALESCE((SELECT json_agg(r ORDER BY r.id DESC) FROM runs r), '[]'::json) AS runs,\n  COALESCE((SELECT json_agg(u ORDER BY u.flips DESC, u.passed_on_retry DESC, u.test_id)\n            FROM (SELECT * FROM unstable WHERE flips > 0 OR passed_on_retry > 0\n                  ORDER BY flips DESC, passed_on_retry DESC LIMIT 10) u), '[]'::json) AS unstable,\n  COALESCE((SELECT json_agg(t ORDER BY t.test_id)\n            FROM (SELECT test_id, status, message FROM test_results\n                  WHERE run_id = (SELECT id FROM latest) AND status IN ('failed', 'error')) t), '[]'::json) AS failing,\n  COALESCE((SELECT json_agg(t ORDER BY t.duration_ms DESC)\n            FROM (SELECT test_id, duration_ms FROM test_results\n                  WHERE run_id = (SELECT id FROM latest) ORDER BY duration_ms DESC LIMIT 10) t), '[]'::json) AS slowest;",
+        "options": {
+          "queryReplacement": "={{ [ String($json.query.project ?? ''), String($json.query.branch ?? '') ] }}"
+        }
+      },
+      "id": "b0c959fa-f3b7-53a6-8e2e-b6226b5011b9",
+      "name": "Load dashboard data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "qaMetricsPostgres",
+          "name": "QA metrics database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Renders the dashboard as one self-contained HTML page: inline CSS, no scripts.\n// Every value is HTML-escaped, because test names and failure messages come from CI reports.\nconst data = $input.first().json;\nconst FLAKY_FLIPS = 3; // same rule as the quality gate\n\nconst esc = (value) => String(value ?? '').replace(/[&<>\"']/g, (c) =>\n  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' })[c]);\n// Test IDs are long; let them wrap after '::' and '.' instead of mid-word.\nconst testName = (id) => esc(id).replace(/\\./g, '.<wbr>').replace(/::/g, '::<wbr>');\nconst pct = (value) => (value === null || value === undefined ? '–' : `${Number(value).toFixed(1)}%`);\nconst secs = (ms) => `${(Number(ms) / 1000).toFixed(1)} s`;\nconst when = (iso) => DateTime.fromISO(iso).toFormat('d LLL yyyy, HH:mm');\nconst level = (rate) => (rate === null ? 'none' : rate >= 95 ? 'good' : rate >= 80 ? 'warn' : 'bad');\nconst link = (project, branch) => `?project=${encodeURIComponent(project)}&branch=${encodeURIComponent(branch)}`;\nconst table = (headers, rows, empty) => rows.length === 0 ? `<p class=\"empty\">${empty}</p>` :\n  `<table><thead><tr>${headers.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table>`;\n\nlet title;\nlet body;\nif (!data.project) {\n  title = 'QA dashboard';\n  body = `<p class=\"sub\">Every project and branch that has sent test results.</p>\n  <section class=\"card\">${table(['Project', 'Branch', 'Runs', 'Last pass rate', 'Last failures', 'Last run'],\n    data.projects.map((p) => `<tr><td><a href=\"${esc(link(p.project, p.branch))}\">${esc(p.project)}</a></td>\n      <td>${esc(p.branch)}</td><td class=\"num\">${p.runs}</td>\n      <td class=\"num\"><span class=\"pill ${level(p.last_pass_rate)}\">${pct(p.last_pass_rate)}</span></td>\n      <td class=\"num\">${p.last_failed}</td><td>${esc(when(p.last_run_at))}</td></tr>`),\n    'No test results yet. Send a JUnit report to <code>POST /webhook/qa/results</code>.')}</section>`;\n} else if (data.runs.length === 0) {\n  title = `QA dashboard: ${data.project}`;\n  body = `<p class=\"sub\">No runs recorded for <strong>${esc(data.project)}</strong> on branch\n    <strong>${esc(data.branch)}</strong> yet. <a href=\"?\">All projects</a></p>`;\n} else {\n  title = `QA dashboard: ${data.project}`;\n  const latest = data.runs[0];\n  const flakyCount = data.unstable.filter((t) => t.flips >= FLAKY_FLIPS || t.passed_on_retry > 0).length;\n  const bars = [...data.runs].reverse().map((r) =>\n    `<div class=\"bar ${level(r.pass_rate)}\" style=\"height:${Math.max(Number(r.pass_rate ?? 0), 2)}%\"\n      title=\"Run ${r.id}: ${pct(r.pass_rate)} (${r.failed} failed)\"></div>`).join('');\n  body = `<p class=\"sub\"><a href=\"?\">All projects</a> · branch <strong>${esc(data.branch)}</strong></p>\n  <div class=\"cards\">\n    <div class=\"card stat\"><span>Last pass rate</span><strong class=\"${level(latest.pass_rate)}\">${pct(latest.pass_rate)}</strong></div>\n    <div class=\"card stat\"><span>Failing now</span><strong>${data.failing.length}</strong></div>\n    <div class=\"card stat\"><span>Flaky tests</span><strong>${flakyCount}</strong></div>\n    <div class=\"card stat\"><span>Runs shown</span><strong>${data.runs.length}</strong></div>\n  </div>\n  <section class=\"card\"><h2>Pass rate, oldest to newest</h2><div class=\"trend\">${bars}</div></section>\n  <div class=\"grid\">\n    <section class=\"card\"><h2>Failing in the latest run</h2>${table(['Test', 'Message'],\n      data.failing.map((t) => `<tr><td><code>${testName(t.test_id)}</code></td><td class=\"msg\">${esc((t.message ?? '').split('\\n')[0])}</td></tr>`),\n      'Nothing is failing.')}</section>\n    <section class=\"card\"><h2>Unstable tests, last 10 runs</h2>${table(['Test', 'Flips', 'Failures', 'Retried'],\n      data.unstable.map((t) => `<tr><td><code>${testName(t.test_id)}</code>${t.flips >= FLAKY_FLIPS || t.passed_on_retry > 0 ? ' <span class=\"pill bad\">flaky</span>' : ''}</td>\n        <td class=\"num\">${t.flips}</td><td class=\"num\">${t.failures}/${t.runs}</td><td class=\"num\">${t.passed_on_retry}</td></tr>`),\n      'No test has changed status recently.')}</section>\n  </div>\n  <section class=\"card\"><h2>Slowest tests in the latest run</h2>${table(['Test', 'Duration'],\n    data.slowest.map((t) => `<tr><td><code>${testName(t.test_id)}</code></td><td class=\"num\">${secs(t.duration_ms)}</td></tr>`), 'No timings.')}</section>\n  <section class=\"card\"><h2>Recent runs</h2>${table(['Run', 'When', 'Commit', 'Pass rate', 'Passed', 'Failed', 'Skipped', 'Duration'],\n    data.runs.map((r) => `<tr><td class=\"num\">${r.build_url ? `<a href=\"${esc(r.build_url)}\">#${r.id}</a>` : `#${r.id}`}</td>\n      <td>${esc(when(r.created_at))}</td><td><code>${esc((r.commit_sha ?? '').slice(0, 8))}</code></td>\n      <td class=\"num\"><span class=\"pill ${level(r.pass_rate)}\">${pct(r.pass_rate)}</span></td>\n      <td class=\"num\">${r.passed}</td><td class=\"num\">${r.failed}</td><td class=\"num\">${r.skipped}</td>\n      <td class=\"num\">${secs(r.duration_ms)}</td></tr>`), '')}</section>`;\n}\n\nconst html = `<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>${esc(title)}</title>\n<style>\n  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2330; --muted:#5d6678; --line:#e3e6ec;\n          --good:#1a7f37; --warn:#9a6700; --bad:#cf222e; --good-bg:#dafbe1; --warn-bg:#fff8c5; --bad-bg:#ffebe9; }\n  @media (prefers-color-scheme: dark) {\n    :root { --bg:#0f1218; --card:#171b23; --text:#e6e9ef; --muted:#9aa3b2; --line:#2a303b;\n            --good:#3fb950; --warn:#d29922; --bad:#f85149; --good-bg:#12261a; --warn-bg:#2a2210; --bad-bg:#2d1415; }\n  }\n  * { box-sizing: border-box; }\n  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, -apple-system, \"Segoe UI\", sans-serif; }\n  main { max-width:1100px; margin:0 auto; padding:24px 16px 48px; }\n  h1 { margin:0 0 4px; font-size:24px; } h2 { margin:0 0 12px; font-size:16px; }\n  a { color:inherit; } .sub { color:var(--muted); margin:0 0 20px; }\n  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; overflow-x:auto; }\n  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:16px; }\n  .stat span { display:block; color:var(--muted); font-size:13px; } .stat strong { font-size:28px; }\n  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:16px; }\n  .grid .card { margin-bottom:0; } .grid { margin-bottom:16px; }\n  table { width:100%; border-collapse:collapse; font-size:14px; }\n  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }\n  th { color:var(--muted); font-weight:600; } .num { text-align:right; white-space:nowrap; }\n  code { font-size:13px; overflow-wrap:anywhere; } .msg { color:var(--muted); }\n  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; }\n  .pill.good { background:var(--good-bg); color:var(--good); } .pill.warn { background:var(--warn-bg); color:var(--warn); }\n  .pill.bad { background:var(--bad-bg); color:var(--bad); } .pill.none { color:var(--muted); }\n  strong.good { color:var(--good); } strong.warn { color:var(--warn); } strong.bad { color:var(--bad); }\n  .trend { display:flex; align-items:flex-end; gap:4px; height:140px; border-bottom:1px solid var(--line); }\n  .bar { flex:1; min-width:6px; border-radius:3px 3px 0 0; }\n  .bar.good { background:var(--good); } .bar.warn { background:var(--warn); } .bar.bad { background:var(--bad); } .bar.none { background:var(--line); }\n  .empty { color:var(--muted); margin:0; }\n</style></head>\n<body><main><h1>${esc(title)}</h1>${body}</main></body></html>`;\n\nreturn [{ json: { html } }];\n"
+      },
+      "id": "c4a9d213-aff9-5682-80e6-d58a5c7997e9",
+      "name": "Render HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "id": "43ce7162-0978-5038-b502-e7aa666c5b60",
+      "name": "Send page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        660,
+        240
+      ]
+    }
+  ],
+  "connections": {
+    "Open dashboard": {
+      "main": [
+        [
+          {
+            "node": "Load dashboard data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load dashboard data": {
+      "main": [
+        [
+          {
+            "node": "Render HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render HTML": {
+      "main": [
+        [
+          {
+            "node": "Send page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

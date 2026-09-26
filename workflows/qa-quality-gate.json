@@ -1,0 +1,372 @@
+{
+  "id": "qaQualityGate001",
+  "name": "QA Quality Gate: ingest JUnit results",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## CI Quality Gate & Flaky Test Detector\n\n`POST /webhook/qa/results` with header `X-QA-Token` and a JSON body:\n\n```json\n{ \"project\": \"org/repo\", \"branch\": \"main\", \"commit\": \"abc123\",\n  \"build_url\": \"https://...\", \"min_pass_rate\": 95,\n  \"junit_xml\": \"<testsuites>...</testsuites>\" }\n```\n\n1. Validates the request (400 with every problem listed).\n2. Parses the JUnit XML, as written by pytest, Maven Surefire and other test runners (400 if it isn't well-formed XML, 422 if it has no test cases).\n3. Stores the run in the `qa_metrics` Postgres database.\n4. Compares it with the previous run on the same branch and looks for flaky tests in the last 10 runs.\n5. Returns the verdict: `gate` is `passed` or `failed`, with reasons and a Markdown summary for CI.\n\n**Gate policy:** fail on a new failure that isn't a known flaky test, or when the pass rate is below `min_pass_rate`. Known flaky tests are reported but never block.",
+        "height": 560,
+        "width": 620,
+        "color": 5
+      },
+      "id": "ef7fcc57-c043-5b6d-8452-8eab96eed38e",
+      "name": "Sticky note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "qa/results",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "aeb13bf0-318a-535f-921c-e4be06bac55d",
+      "name": "Receive results",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        320
+      ],
+      "webhookId": "e0bd044f-f456-5111-ae1f-70c9edc2aa4e",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "qaGateHeaderAuth",
+          "name": "QA Gate API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Checks the request body and normalizes its fields. Invalid requests get a 400 with every problem listed.\nconst body = $input.first().json.body ?? {};\nconst text = (value) => (typeof value === 'string' ? value.trim() : '');\n\nconst project = text(body.project);\nconst branch = text(body.branch) || 'main';\nconst commit = text(body.commit);\nconst buildUrl = text(body.build_url);\nconst junitXml = typeof body.junit_xml === 'string' ? body.junit_xml : '';\nconst minPassRate = body.min_pass_rate ?? 95;\n\nconst errors = [];\nif (!project) errors.push('project is required');\nelse if (!/^\\S{1,120}$/.test(project)) errors.push('project must be 1-120 characters with no spaces');\nif (!/^\\S{1,200}$/.test(branch)) errors.push('branch must be 1-200 characters with no spaces');\nif (commit && !/^\\S{1,64}$/.test(commit)) errors.push('commit must be 1-64 characters with no spaces');\nif (buildUrl && !/^https?:\\/\\/\\S+$/.test(buildUrl)) errors.push('build_url must be an http(s) URL');\nif (!junitXml.trim()) errors.push('junit_xml is required: send the JUnit XML report as a string');\nelse if (junitXml.length > 5 * 1024 * 1024) errors.push('junit_xml is larger than 5 MB');\nif (typeof minPassRate !== 'number' || !Number.isFinite(minPassRate) || minPassRate < 0 || minPassRate > 100) {\n  errors.push('min_pass_rate must be a number from 0 to 100');\n}\n\nif (errors.length > 0) {\n  return [{ json: { ok: false, status_code: 400, error: 'Invalid request', details: errors } }];\n}\nreturn [{\n  json: { ok: true, project, branch, commit, build_url: buildUrl, min_pass_rate: minPassRate, junit_xml: junitXml },\n}];\n"
+      },
+      "id": "c305799c-41a6-5681-966c-8d3949b1757a",
+      "name": "Validate request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "536fca14-71c3-51e6-89bb-49e36c761ff4",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "225401e9-4f0c-592c-8c0b-a2e62bb9a52b",
+      "name": "Request valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "xmlToJson",
+        "dataPropertyName": "junit_xml",
+        "options": {
+          "explicitArray": true,
+          "mergeAttrs": false
+        }
+      },
+      "id": "a297c9e6-4fc9-50ca-b378-73246dc70bd6",
+      "name": "Parse JUnit XML",
+      "type": "n8n-nodes-base.xml",
+      "typeVersion": 1,
+      "position": [
+        660,
+        220
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turns the parsed JUnit XML into one row per test case, plus run totals.\n// Handles <testsuites> and <testsuite> roots, nested suites, and Maven Surefire reruns\n// (<flakyFailure>/<flakyError>: the test failed, then passed when it was rerun).\nconst request = $('Validate request').first().json;\nconst doc = $input.first().json;\n\n// When the XML can't be parsed, the XML node outputs an empty item (alwaysOutputData is on).\n// It should output the parser error instead, but in n8n 2.40 its \"continue on error\" setting\n// drops that item, so check here and handle both shapes.\nconst keys = Object.keys(doc);\nif (keys.length === 0 || (keys.length === 1 && typeof doc.error === 'string')) {\n  const reason = typeof doc.error === 'string'\n    ? doc.error.split('\\n')[0]\n    : 'The report is not well-formed XML, for example a truncated file or an unclosed tag';\n  return [{ json: { ok: false, status_code: 400, error: 'junit_xml is not valid XML', details: [reason] } }];\n}\n\nconst list = (value) => (value === undefined || value === null ? [] : Array.isArray(value) ? value : [value]);\nconst attr = (node, key) => (node && typeof node === 'object' && node.$ ? node.$[key] : undefined);\nconst messageOf = (node) => {\n  if (node === undefined || node === null) return null;\n  if (typeof node === 'string') return node.trim() || null;\n  return attr(node, 'message') ?? (typeof node._ === 'string' ? node._.trim() : null);\n};\n\nconst suites = [];\nconst collect = (parent) => {\n  for (const suite of list(parent.testsuite)) {\n    suites.push(suite);\n    collect(suite);\n  }\n};\nfor (const root of list(doc.testsuites)) collect(root);\ncollect(doc);\n\nconst tests = [];\nfor (const suite of suites) {\n  const suiteName = attr(suite, 'name') ?? '';\n  for (const testcase of list(suite.testcase)) {\n    const name = attr(testcase, 'name') ?? '(unnamed)';\n    const classname = attr(testcase, 'classname') || suiteName;\n    const failure = list(testcase.failure)[0];\n    const error = list(testcase.error)[0];\n    const skipped = list(testcase.skipped)[0];\n    const rerun = list(testcase.flakyFailure)[0] ?? list(testcase.flakyError)[0];\n\n    let status = 'passed';\n    let message = null;\n    if (failure !== undefined) [status, message] = ['failed', messageOf(failure)];\n    else if (error !== undefined) [status, message] = ['error', messageOf(error)];\n    else if (skipped !== undefined) [status, message] = ['skipped', messageOf(skipped)];\n    else if (rerun !== undefined) message = messageOf(rerun);\n\n    const seconds = Number.parseFloat(attr(testcase, 'time') ?? '0');\n    tests.push({\n      test_id: `${classname}::${name}`,\n      suite: suiteName,\n      name,\n      status,\n      duration_ms: Number.isFinite(seconds) ? Math.round(seconds * 1000) : 0,\n      message: message ? message.slice(0, 2000) : null,\n      retried: status === 'passed' && rerun !== undefined,\n    });\n  }\n}\n\nif (tests.length === 0) {\n  return [{\n    json: { ok: false, status_code: 422, error: 'No test cases found', details: ['The report has no <testcase> elements'] },\n  }];\n}\n\nconst count = (...statuses) => tests.filter((test) => statuses.includes(test.status)).length;\nconst { junit_xml, ...metadata } = request;\nreturn [{\n  json: {\n    ...metadata,\n    total: tests.length,\n    passed: count('passed'),\n    failed: count('failed', 'error'),\n    skipped: count('skipped'),\n    duration_ms: tests.reduce((sum, test) => sum + test.duration_ms, 0),\n    tests,\n  },\n}];\n"
+      },
+      "id": "4f4ecdb3-28f5-5a6c-9a22-bd070ec6680c",
+      "name": "Normalize results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ff2bd849-fefb-53e3-bb79-2aa9469e4990",
+              "leftValue": "={{ $json.ok !== false }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5a595cb9-499f-5044-a8c9-7cd93e81a532",
+      "name": "Report usable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Stores the run and all of its test results in one statement.\nWITH run AS (\n  INSERT INTO test_runs (project, branch, commit_sha, build_url, total, passed, failed, skipped, duration_ms)\n  VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9)\n  RETURNING id\n), saved AS (\n  INSERT INTO test_results (run_id, test_id, suite, name, status, duration_ms, message, retried)\n  SELECT run.id, t.test_id, t.suite, t.name, t.status, t.duration_ms, t.message, t.retried\n  FROM run, jsonb_to_recordset($10::jsonb) AS t (\n    test_id text, suite text, name text, status text, duration_ms integer, message text, retried boolean\n  )\n  RETURNING 1\n)\nSELECT run.id AS run_id, (SELECT count(*) FROM saved)::int AS saved_results FROM run;",
+        "options": {
+          "queryReplacement": "={{ [ $json.project, $json.branch, $json.commit, $json.build_url, $json.total, $json.passed, $json.failed, $json.skipped, $json.duration_ms, JSON.stringify($json.tests) ] }}"
+        }
+      },
+      "id": "c6a1a378-16fa-5af3-ab8a-2733117ec41b",
+      "name": "Save run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1320,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "qaMetricsPostgres",
+          "name": "QA metrics database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Compares this run with the previous run of the same project and branch, and finds flaky tests:\n-- tests whose result flipped between pass and fail at least $3 times in the last $2 runs,\n-- or that only passed after a rerun.\nWITH cur AS (\n  SELECT id, project, branch FROM test_runs WHERE id = $1::bigint\n), recent AS (\n  SELECT r.id FROM test_runs r JOIN cur ON r.project = cur.project AND r.branch = cur.branch\n  WHERE r.id <= cur.id ORDER BY r.id DESC LIMIT $2::int\n), prev AS (\n  SELECT max(r.id) AS id FROM test_runs r JOIN cur ON r.project = cur.project AND r.branch = cur.branch\n  WHERE r.id < cur.id\n), now_res AS (\n  SELECT test_id, status FROM test_results WHERE run_id = $1::bigint\n), prev_res AS (\n  SELECT test_id, status FROM test_results WHERE run_id = (SELECT id FROM prev)\n), history AS (\n  SELECT test_id, status, retried,\n         lag(status) OVER (PARTITION BY test_id ORDER BY run_id) AS prev_status\n  FROM test_results\n  WHERE run_id IN (SELECT id FROM recent) AND status <> 'skipped'\n), flaky AS (\n  SELECT test_id,\n         count(*) FILTER (WHERE prev_status IS NOT NULL AND (prev_status = 'passed') <> (status = 'passed'))::int AS flips,\n         count(*) FILTER (WHERE retried)::int AS passed_on_retry,\n         count(*) FILTER (WHERE status <> 'passed')::int AS failures,\n         count(*)::int AS runs\n  FROM history\n  GROUP BY test_id\n)\nSELECT\n  (SELECT id FROM prev) AS previous_run_id,\n  (SELECT count(*) FROM recent)::int AS runs_in_window,\n  COALESCE((SELECT json_agg(n.test_id ORDER BY n.test_id)\n            FROM now_res n LEFT JOIN prev_res p USING (test_id)\n            WHERE n.status IN ('failed', 'error') AND (p.status IS NULL OR p.status NOT IN ('failed', 'error'))),\n           '[]'::json) AS new_failures,\n  COALESCE((SELECT json_agg(n.test_id ORDER BY n.test_id)\n            FROM now_res n JOIN prev_res p USING (test_id)\n            WHERE n.status IN ('failed', 'error') AND p.status IN ('failed', 'error')),\n           '[]'::json) AS still_failing,\n  COALESCE((SELECT json_agg(n.test_id ORDER BY n.test_id)\n            FROM now_res n JOIN prev_res p USING (test_id)\n            WHERE n.status = 'passed' AND p.status IN ('failed', 'error')),\n           '[]'::json) AS fixed,\n  COALESCE((SELECT json_agg(json_build_object('test_id', f.test_id, 'flips', f.flips, 'failures', f.failures,\n                                              'runs', f.runs, 'passed_on_retry', f.passed_on_retry)\n                            ORDER BY f.flips DESC, f.test_id)\n            FROM flaky f JOIN now_res n USING (test_id)\n            WHERE f.flips >= $3::int OR f.passed_on_retry > 0),\n           '[]'::json) AS flaky;",
+        "options": {
+          "queryReplacement": "={{ [ $json.run_id, 10, 3 ] }}"
+        }
+      },
+      "id": "1ef4ae6e-5598-5b9c-a28a-c12c53e1bdc2",
+      "name": "Analyze history",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1540,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "qaMetricsPostgres",
+          "name": "QA metrics database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Applies the gate policy and builds the response.\n// The gate fails when:\n//   - a test fails that didn't fail in the previous run, unless it's a known flaky test, or\n//   - the pass rate (skipped tests excluded) is below min_pass_rate.\n// Known flaky tests are reported but never block, so one unstable test can't hold up every build.\nconst run = $('Normalize results').first().json;\nconst saved = $('Save run').first().json;\nconst history = $input.first().json;\n\nconst executed = run.total - run.skipped;\nconst passRate = executed > 0 ? Math.round((run.passed / executed) * 10000) / 100 : 100;\nconst flakyIds = new Set(history.flaky.map((test) => test.test_id));\nconst blocking = history.new_failures.filter((id) => !flakyIds.has(id));\n\nconst reasons = [];\nif (blocking.length > 0) {\n  const shown = blocking.slice(0, 5).join(', ') + (blocking.length > 5 ? ` and ${blocking.length - 5} more` : '');\n  reasons.push(`${blocking.length} new failure${blocking.length === 1 ? '' : 's'}: ${shown}`);\n}\nif (passRate < run.min_pass_rate) {\n  reasons.push(`pass rate ${passRate}% is below the required ${run.min_pass_rate}%`);\n}\nconst gate = reasons.length === 0 ? 'passed' : 'failed';\n\nconst failures = run.tests\n  .filter((test) => test.status === 'failed' || test.status === 'error')\n  .slice(0, 50)\n  .map((test) => ({ test_id: test.test_id, status: test.status, message: test.message, flaky: flakyIds.has(test.test_id) }));\n\nconst headers = $('Receive results').first().json.headers ?? {};\nconst origin = `${headers['x-forwarded-proto'] ?? 'http'}://${headers['x-forwarded-host'] ?? headers.host ?? 'localhost:5678'}`;\nconst dashboardUrl = `${origin}/webhook/qa/dashboard?project=${encodeURIComponent(run.project)}&branch=${encodeURIComponent(run.branch)}`;\n\n// Markdown summary, e.g. for $GITHUB_STEP_SUMMARY.\nconst code = (text) => '`' + String(text).replace(/`/g, \"'\") + '`';\nconst firstLine = (text) => (text ? String(text).split('\\n')[0].slice(0, 160) : '');\nconst lines = [\n  `## ${gate === 'passed' ? '✅' : '❌'} Quality gate ${gate}: ${run.project} (${run.branch})`,\n  '',\n  '| Total | Passed | Failed | Skipped | Pass rate | Duration |',\n  '|---:|---:|---:|---:|---:|---:|',\n  `| ${run.total} | ${run.passed} | ${run.failed} | ${run.skipped} | ${passRate}% (min ${run.min_pass_rate}%) | ${(run.duration_ms / 1000).toFixed(1)} s |`,\n];\nif (reasons.length > 0) lines.push('', `**Why it failed:** ${reasons.join('; ')}.`);\nconst section = (title, entries) => {\n  if (entries.length > 0) lines.push('', `### ${title} (${entries.length})`, '', ...entries);\n};\nsection('New failures', history.new_failures.map((id) => {\n  const failure = failures.find((f) => f.test_id === id);\n  const note = flakyIds.has(id) ? ' _(known flaky, not blocking)_' : '';\n  return `- ${code(id)}${note}${failure?.message ? ` — ${firstLine(failure.message)}` : ''}`;\n}));\nsection('Still failing', history.still_failing.map((id) => `- ${code(id)}`));\nsection('Flaky', history.flaky.map((test) =>\n  `- ${code(test.test_id)} — ${test.flips} pass/fail flips in the last ${history.runs_in_window} runs` +\n  (test.passed_on_retry > 0 ? `, passed on retry ${test.passed_on_retry} time${test.passed_on_retry === 1 ? '' : 's'}` : '')));\nsection('Fixed since the previous run', history.fixed.map((id) => `- ${code(id)}`));\n\nreturn [{\n  json: {\n    run_id: Number(saved.run_id),\n    previous_run_id: history.previous_run_id === null ? null : Number(history.previous_run_id),\n    project: run.project,\n    branch: run.branch,\n    commit: run.commit || null,\n    gate,\n    reasons,\n    stats: {\n      total: run.total,\n      passed: run.passed,\n      failed: run.failed,\n      skipped: run.skipped,\n      pass_rate: passRate,\n      min_pass_rate: run.min_pass_rate,\n      duration_ms: run.duration_ms,\n    },\n    new_failures: history.new_failures,\n    still_failing: history.still_failing,\n    fixed: history.fixed,\n    flaky: history.flaky,\n    failures,\n    dashboard_url: dashboardUrl,\n    summary_markdown: lines.join('\\n'),\n  },\n}];\n"
+      },
+      "id": "914b4658-78d2-5d1c-bd18-d99a28588cb7",
+      "name": "Evaluate quality gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "3c11a97e-6f51-5abb-a0e7-60c71638dda2",
+      "name": "Respond with verdict",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1980,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: $json.error, details: $json.details } }}",
+        "options": {
+          "responseCode": "={{ $json.status_code }}"
+        }
+      },
+      "id": "b86d3927-956b-5c96-a8de-50b0b0eb923f",
+      "name": "Respond with error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1320,
+        400
+      ]
+    }
+  ],
+  "connections": {
+    "Receive results": {
+      "main": [
+        [
+          {
+            "node": "Validate request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate request": {
+      "main": [
+        [
+          {
+            "node": "Request valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request valid?": {
+      "main": [
+        [
+          {
+            "node": "Parse JUnit XML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond with error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse JUnit XML": {
+      "main": [
+        [
+          {
+            "node": "Normalize results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize results": {
+      "main": [
+        [
+          {
+            "node": "Report usable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report usable?": {
+      "main": [
+        [
+          {
+            "node": "Save run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond with error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save run": {
+      "main": [
+        [
+          {
+            "node": "Analyze history",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze history": {
+      "main": [
+        [
+          {
+            "node": "Evaluate quality gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate quality gate": {
+      "main": [
+        [
+          {
+            "node": "Respond with verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

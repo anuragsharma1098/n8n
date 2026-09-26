@@ -6,3 +6,8 @@ backups/
 local-files/
 # Personal Claude Code settings
 .claude/settings.local.json
+# Python virtual environment, caches and test reports
+.venv/
+__pycache__/
+.pytest_cache/
+reports/

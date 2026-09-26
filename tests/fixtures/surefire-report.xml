@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report-3.0.xsd" version="3.0" name="com.example.checkout.CheckoutTest" time="4.21" tests="4" errors="0" skipped="0" failures="1" flakes="1">
+  <properties>
+    <property name="java.version" value="21.0.4"/>
+    <property name="surefire.rerunFailingTestsCount" value="2"/>
+  </properties>
+  <testcase name="addsItemToCart" classname="com.example.checkout.CheckoutTest" time="0.35"/>
+  <testcase name="appliesDiscountCode" classname="com.example.checkout.CheckoutTest" time="1.02">
+    <flakyFailure message="Timed out after 1000ms waiting for the price to update" type="org.openqa.selenium.TimeoutException">
+      <stackTrace>org.openqa.selenium.TimeoutException: Timed out after 1000ms waiting for the price to update
+	at com.example.checkout.CheckoutTest.appliesDiscountCode(CheckoutTest.java:48)</stackTrace>
+    </flakyFailure>
+  </testcase>
+  <testcase name="calculatesTax" classname="com.example.checkout.CheckoutTest" time="0.12">
+    <failure message="expected: &lt;18.00&gt; but was: &lt;17.99&gt;" type="org.opentest4j.AssertionFailedError"><![CDATA[org.opentest4j.AssertionFailedError: expected: <18.00> but was: <17.99>
+	at com.example.checkout.CheckoutTest.calculatesTax(CheckoutTest.java:62)]]></failure>
+  </testcase>
+  <testcase name="placesOrder" classname="com.example.checkout.CheckoutTest" time="2.72"/>
+</testsuite>

@@ -1,0 +1,97 @@
+# Running the stack
+
+How to operate the Docker Compose stack this project runs on. For setup, see the [README](../README.md#getting-started).
+
+| Service | Open | What it is |
+|---|---|---|
+| n8n | http://localhost:5678 | The workflow editor. The first time you open it, create the owner account. |
+| Adminer | http://localhost:8080 | A web UI for the Postgres database where n8n stores its data. |
+
+The containers are n8n, Postgres, Adminer, and `n8n-runners`, which runs Code nodes. Only this PC can reach them. They run only while Docker Desktop is running. If they were running when Docker Desktop quit, they start again with it; after `docker compose stop` or `down`, start them with `docker compose up -d`. Docker Desktop itself only starts at sign-in if **Start Docker Desktop when you sign in to your computer** is on in its settings.
+
+## Everyday commands
+
+Run these from the repository root.
+
+| Task | Command |
+|---|---|
+| Start (also after `stop` or `down`) | `docker compose up -d` |
+| Stop (keeps the containers) | `docker compose stop` |
+| Stop and remove the containers | `docker compose down` |
+| Follow n8n logs (Ctrl+C to stop) | `docker compose logs -f n8n` |
+| Update | For a newer n8n, first change `N8N_VERSION` in `.env`. Then `docker compose pull`, then `docker compose up -d` |
+
+None of these commands delete your data. It lives in two Docker volumes:
+
+- `n8n_postgres_data`: the Postgres databases: n8n's own (workflows, credentials, execution history) and `qa_metrics` (test results).
+- `n8n_data`: n8n's encryption key, plus files your workflows handle and any community nodes you install. Without the key, the credentials saved in the database can't be decrypted.
+
+`docker compose down -v` deletes both volumes, so only add `-v` when you mean to wipe n8n.
+
+n8n only changes version when you change `N8N_VERSION` in `.env` (see [releases](https://github.com/n8n-io/n8n/releases)). The n8n and task-runner images both use it, so they always match. Postgres stays on major version 18, because a newer major version can't read the data without an upgrade. Take a [backup](#backup) before updating.
+
+## Adminer
+
+Open http://localhost:8080/?pgsql=postgres&username=n8n&db=n8n to get the login form pre-filled, then enter the `POSTGRES_PASSWORD` value from `.env`. The test results are in the `qa_metrics` database.
+
+Editing n8n's own tables by hand can break n8n, so treat them as read-only.
+
+## Using Postgres in your workflows
+
+In n8n, create a Postgres credential with host `postgres`, port `5432`, and the user and password from `.env`. Keep your own tables out of the `n8n` database: create a separate database in Adminer ("Create database") and connect to that one, as the QA workflows do with `qa_metrics`.
+
+## Files for workflows
+
+The `local-files` folder is mounted in the n8n container at `/files`. In the Read/Write Files from Disk node, use paths such as `/files/input.csv`. n8n can't read or write files outside that folder.
+
+## Connect Claude Code (MCP)
+
+`.mcp.json` connects Claude Code to n8n's built-in MCP server at `http://localhost:5678/mcp-server/http`, so Claude can build, run and test workflows in n8n. It holds no secrets.
+
+One-time setup:
+
+1. In n8n, go to **Settings → Instance-level MCP** and click **Enable MCP access**.
+2. Start a new Claude Code session in this folder. If it asks whether to use the `n8n` server from `.mcp.json`, approve it.
+3. Run `/mcp`, select `n8n`, and choose **Authenticate**. A browser tab opens where you sign in to n8n and allow access.
+
+Claude can't see workflows you build in the editor until you expose them: use **Enable workflows** on the same settings page.
+
+## Backup
+
+Stops n8n for about half a minute and saves the databases and the encryption key to `backups\n8n-backup-<date>.tar.gz` (PowerShell):
+
+```powershell
+docker compose stop
+docker run --rm -v n8n_data:/n8n -v n8n_postgres_data:/postgres -v "${PWD}\backups:/backup" alpine tar czf "/backup/n8n-backup-$(Get-Date -Format yyyy-MM-dd).tar.gz" -C / n8n postgres
+docker compose up -d
+```
+
+Anyone with a backup file can decrypt your saved credentials, so keep backups private.
+
+## Restore
+
+Replaces all n8n data with the backup. Change the file name to the backup you want (PowerShell):
+
+```powershell
+docker compose down -v
+docker compose create
+docker run --rm -v n8n_data:/n8n -v n8n_postgres_data:/postgres -v "${PWD}\backups:/backup" alpine tar xzf /backup/n8n-backup-2026-09-25.tar.gz -C /
+docker compose up -d
+```
+
+## Changing settings
+
+Edit `docker-compose.yml`, then run `docker compose up -d` to apply.
+
+- **Open n8n from other devices on your network:** change the n8n port line to `"5678:5678"` and add `N8N_SECURE_COOKIE=false` under its `environment` (needed because the connection is plain http). Then browse to `http://<this PC's IP>:5678`.
+- **Receive webhooks from the internet:** run a tunnel (ngrok, Cloudflare Tunnel) and set `N8N_WEBHOOK_URL` to its public URL.
+- **Postgres login in `.env`:** these values only take effect when the database is first created, so changing them later breaks n8n's connection. To change the password, first run `ALTER USER n8n WITH PASSWORD 'new-password';` in Adminer (**SQL command**), then put the same value in `.env`, run `docker compose up -d`, and run `python scripts/install_workflows.py` so the QA workflows' database credential gets the new password too.
+
+## Code nodes
+
+JavaScript and Python Code nodes run in the `n8n-runners` container. By default, n8n limits what their code can import:
+
+- JavaScript: only `crypto` and `moment`.
+- Python: nothing. For example, `import json` fails with "Import of standard library module 'json' is disallowed".
+
+Allowing more modules means replacing the runner's config file (`/etc/n8n-task-runners.json` in `n8n-runners`). See [n8n's task runner docs](https://docs.n8n.io/deploy/host-n8n/configure-n8n/set-up-task-runners).

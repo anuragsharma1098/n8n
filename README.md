@@ -1,103 +1,211 @@
-# n8n (local, Docker)
+# CI Quality Gate & Flaky Test Detector
 
-| Service | Open | What it is |
+[![CI](https://github.com/anuragsharma1098/n8n/actions/workflows/ci.yml/badge.svg)](https://github.com/anuragsharma1098/n8n/actions/workflows/ci.yml)
+
+A quality gate for CI pipelines, built as [n8n](https://n8n.io) workflows. A CI job sends its JUnit XML report; the gate stores the run in Postgres, compares it with the branch's history, and answers **passed** or **failed**. It tells new failures apart from known ones and recognizes flaky tests, so an unstable test doesn't block every build.
+
+It's tested the way a production service would be: 51 automated tests, and a GitHub Actions pipeline that brings up the whole stack, runs them end to end, and then sends its own results through the gate.
+
+![QA dashboard showing the pass-rate trend, the failing test and two flaky tests](docs/images/dashboard.png)
+
+## What it does
+
+- **Reads JUnit XML** as written by pytest, Maven Surefire and other test runners, including nested suites and Surefire reruns (`<flakyFailure>`).
+- **Classifies every failure** by comparing with the previous run on the same branch: *new failure*, *still failing*, or *fixed*.
+- **Detects flaky tests**: a test is flaky if its result flipped between pass and fail at least 3 times in the last 10 runs, or if it only passed after a rerun.
+- **Applies a gate policy**: fail on a new failure that isn't known to be flaky, or when the pass rate is below a threshold (95% by default, set per request). Known flaky tests are reported but don't block.
+- **Answers CI** with JSON and a ready-made Markdown summary for the job's summary page.
+- **Serves a dashboard** with the pass-rate trend, failing tests, flaky and unstable tests, slowest tests and recent runs.
+
+## How it works
+
+Two workflows in [`workflows/`](workflows):
+
+```mermaid
+flowchart LR
+    CI["CI job"] -->|"POST /webhook/qa/results<br>X-QA-Token + JUnit XML"| V{"Valid<br>request?"}
+    V -- no --> E1["400: every problem listed"]
+    V -- yes --> P["Parse JUnit XML"] --> N["Normalize<br>test cases"] --> U{"Usable<br>report?"}
+    U -- no --> E2["400: not XML<br>422: no test cases"]
+    U -- yes --> S[("Save run<br>Postgres")] --> A[("Analyze history<br>SQL window functions")] --> G["Apply gate<br>policy"] --> R["200: verdict +<br>Markdown summary"]
+```
+
+- **QA Quality Gate: ingest JUnit results** (`POST /webhook/qa/results`). Protected by an API key in the `X-QA-Token` header.
+- **QA Quality Gate: dashboard** (`GET /webhook/qa/dashboard`). A read-only HTML page with no scripts, where every value from a report is HTML-escaped.
+
+Flakiness is computed in SQL: `lag()` over each test's results in the last 10 runs counts how often it flipped between pass and fail ([`workflows/qa-quality-gate.json`](workflows/qa-quality-gate.json), node *Analyze history*). The schema is in [`sql/schema.sql`](sql/schema.sql).
+
+## Getting started
+
+You need [Git](https://git-scm.com/downloads), [Docker Desktop](https://www.docker.com/products/docker-desktop/) (running) and [Python](https://www.python.org/downloads/) 3.10 or newer. The commands work in PowerShell, Terminal on macOS and Linux shells. On macOS and Linux, type `python3` where it says `python`.
+
+**1. Get the code**
+
+```bash
+git clone https://github.com/anuragsharma1098/n8n.git
+cd n8n
+```
+
+**2. Create your settings file**
+
+```bash
+python scripts/create_env.py
+```
+
+This creates `.env` with random passwords and keys. It stays on your computer, and git ignores it.
+
+**3. Start n8n**
+
+```bash
+docker compose up -d --wait
+```
+
+This starts n8n, Postgres, Adminer and the Code-node runners. The first time, Docker downloads about 3 GB of images, so it can take a few minutes.
+
+**4. Create your n8n account**
+
+Open http://localhost:5678 and fill in the account form. The account is stored only in your local n8n, and it's the owner of this n8n.
+
+**5. Import the workflows into your account**
+
+```bash
+python scripts/install_workflows.py
+```
+
+This creates the `qa_metrics` database, adds the two workflows and their credentials to your account, publishes the workflows, and restarts n8n (about 20 seconds). Refresh n8n: the workflows are under **Overview**. Running this before step 4 works too; the workflows become yours when you create the account.
+
+**6. Run it**
+
+Send a sample test report to the quality gate:
+
+```bash
+python scripts/publish_results.py tests/fixtures/pytest-report.xml --project my-first-try
+```
+
+It prints the verdict: **failed**, because 2 of the 5 tests that ran failed. Send the same report again with `--min-pass-rate 50` added and the gate passes: the two failures are no longer new, and 60% meets the threshold.
+
+Then open the dashboard at http://localhost:5678/webhook/qa/dashboard. To see it with a longer history, load 12 demo runs and open the demo project:
+
+```bash
+python scripts/seed_demo_data.py
+```
+
+http://localhost:5678/webhook/qa/dashboard?project=demo/shop-api
+
+**7. Watch a run inside n8n (optional)**
+
+Open **QA Quality Gate: ingest JUnit results** in n8n and click **Execute workflow**. The editor then waits about 2 minutes for one report sent to the workflow's test URL. Send one with `--test`, and each node shows the data it received and produced:
+
+```bash
+python scripts/publish_results.py tests/fixtures/pytest-report.xml --project my-first-try --test
+```
+
+Reports sent without `--test` go to the published workflow. They don't appear on the canvas, but you can open each one from the workflow's **Executions** tab.
+
+**Stopping and starting again:** `docker compose stop` stops everything and `docker compose up -d` starts it again. Your data is kept. For backups, updates and more, see [docs/operations.md](docs/operations.md). To send your own test results, see [Use it from CI](#use-it-from-ci).
+
+## Use it from CI
+
+[`scripts/publish_results.py`](scripts/publish_results.py) sends a report and exits with 0 when the gate passes, 1 when it fails, and 2 when the request fails. It's one file that uses only the Python standard library, so you can copy it into any repo. In GitHub Actions:
+
+```yaml
+- name: Quality gate
+  env:
+    N8N_URL: https://n8n.example.com
+    QA_GATE_TOKEN: ${{ secrets.QA_GATE_TOKEN }}
+    PROJECT: ${{ github.repository }}
+    BRANCH: ${{ github.head_ref || github.ref_name }}
+    COMMIT: ${{ github.sha }}
+  run: >
+    python scripts/publish_results.py reports/junit.xml
+    --project "$PROJECT" --branch "$BRANCH" --commit "$COMMIT"
+    --summary-file "$GITHUB_STEP_SUMMARY"
+```
+
+The values go through `env` rather than straight into the command because branch names come from pull requests, and putting them directly into a script allows [script injection](https://docs.github.com/en/actions/reference/security/secure-use#good-practices-for-mitigating-script-injection-attacks).
+
+### API
+
+`POST /webhook/qa/results` with header `X-QA-Token` and a JSON body:
+
+| Field | Required | Meaning |
 |---|---|---|
-| n8n | http://localhost:5678 | The workflow editor. The first time you open it, create the owner account. |
-| Adminer | http://localhost:8080 | A web UI for the Postgres database where n8n stores its data. |
+| `project` | yes | Project name, e.g. `org/repo`. No spaces. |
+| `junit_xml` | yes | The JUnit XML report, as a string (up to 5 MB). |
+| `branch` | no | Default `main`. History is kept per project and branch. |
+| `commit` | no | Commit SHA, shown on the dashboard. |
+| `build_url` | no | Link to the CI run. |
+| `min_pass_rate` | no | Required pass rate in percent, 0 to 100. Default 95. Skipped tests don't count. |
 
-The containers are n8n, Postgres, Adminer, and `n8n-runners`, which runs Code nodes. Only this PC can reach them. They run only while Docker Desktop is running. If they were running when Docker Desktop quit, they start again with it; after `docker compose stop` or `down`, start them with `docker compose up -d`. Docker Desktop itself only starts at sign-in if **Start Docker Desktop when you sign in to your computer** is on in its settings.
+Responses: **200** with the verdict, **400** for an invalid request or XML that isn't well-formed (every problem is listed), **403** for a missing or wrong API key, **422** for XML with no test cases. A 200 response looks like this (shortened; it also includes `summary_markdown`):
 
-## First-time setup
-
-Only needed on a new machine or a fresh copy of this folder. The `.env` here is already set up.
-
-1. Copy the example: `Copy-Item .env.example .env`
-2. In `.env`, fill in `POSTGRES_PASSWORD` and `N8N_RUNNERS_AUTH_TOKEN` with long random values. The comment at the top of the file has a command that generates one.
-3. Run `docker compose up -d`.
-
-## Everyday commands
-
-Run these in PowerShell from this folder.
-
-| Task | Command |
-|---|---|
-| Start (also after `stop` or `down`) | `docker compose up -d` |
-| Stop (keeps the containers) | `docker compose stop` |
-| Stop and remove the containers | `docker compose down` |
-| Follow n8n logs (Ctrl+C to stop) | `docker compose logs -f n8n` |
-| Update | For a newer n8n, first change `N8N_VERSION` in `.env`. Then `docker compose pull`, then `docker compose up -d` |
-
-None of these commands delete your data. It lives in two Docker volumes:
-
-- `n8n_postgres_data`: the Postgres database with your workflows, credentials and execution history.
-- `n8n_data`: n8n's encryption key, plus files your workflows handle and any community nodes you install. Without the key, the credentials saved in the database can't be decrypted.
-
-`docker compose down -v` deletes both volumes, so only add `-v` when you mean to wipe n8n.
-
-n8n only changes version when you change `N8N_VERSION` in `.env` (see [releases](https://github.com/n8n-io/n8n/releases)). The n8n and task-runner images both use it, so they always match. Postgres stays on major version 18, because a newer major version can't read the data without an upgrade. Take a [backup](#backup) before updating.
-
-## Adminer
-
-Open http://localhost:8080/?pgsql=postgres&username=n8n&db=n8n to get the login form pre-filled, then enter the `POSTGRES_PASSWORD` value from `.env`.
-
-Editing n8n's own tables by hand can break n8n, so treat them as read-only.
-
-## Using Postgres in your workflows
-
-In n8n, create a Postgres credential with host `postgres`, port `5432`, and the user and password from `.env`. Keep your own tables out of the `n8n` database: create a separate database in Adminer ("Create database") and connect to that one.
-
-## Files for workflows
-
-The `local-files` folder is mounted in the n8n container at `/files`. In the Read/Write Files from Disk node, use paths such as `/files/input.csv`. n8n can't read or write files outside that folder.
-
-## Connect Claude Code (MCP)
-
-`.mcp.json` connects Claude Code to n8n's built-in MCP server at `http://localhost:5678/mcp-server/http`, so Claude can build, run and test workflows in n8n. It holds no secrets.
-
-One-time setup:
-
-1. In n8n, go to **Settings → Instance-level MCP** and click **Enable MCP access**.
-2. Start a new Claude Code session in this folder. If it asks whether to use the `n8n` server from `.mcp.json`, approve it.
-3. Run `/mcp`, select `n8n`, and choose **Authenticate**. A browser tab opens where you sign in to n8n and allow access.
-
-Claude can't see workflows you build in the editor until you expose them: use **Enable workflows** on the same settings page.
-
-## Backup
-
-Stops n8n for about half a minute and saves the database and the encryption key to `backups\n8n-backup-<date>.tar.gz`:
-
-```powershell
-docker compose stop
-docker run --rm -v n8n_data:/n8n -v n8n_postgres_data:/postgres -v "${PWD}\backups:/backup" alpine tar czf "/backup/n8n-backup-$(Get-Date -Format yyyy-MM-dd).tar.gz" -C / n8n postgres
-docker compose up -d
+```json
+{
+  "run_id": 206,
+  "previous_run_id": 157,
+  "gate": "failed",
+  "reasons": ["pass rate 66.67% is below the required 95%"],
+  "stats": { "total": 3, "passed": 2, "failed": 1, "skipped": 0, "pass_rate": 66.67, "min_pass_rate": 95, "duration_ms": 3680 },
+  "new_failures": ["tests.api.test_checkout::test_apply_coupon"],
+  "still_failing": [],
+  "fixed": [],
+  "flaky": [{ "test_id": "tests.api.test_checkout::test_apply_coupon", "flips": 7, "failures": 4, "runs": 10, "passed_on_retry": 0 }],
+  "failures": [{ "test_id": "tests.api.test_checkout::test_apply_coupon", "status": "failed",
+                 "message": "AssertionError: expected total 45.00, got 50.00", "flaky": true }],
+  "dashboard_url": "http://localhost:5678/webhook/qa/dashboard?project=demo%2Fshop-api&branch=main"
+}
 ```
 
-Anyone with a backup file can decrypt your saved credentials, so keep backups private.
+Here the coupon test failed after passing in the previous run, but it's known to be flaky, so it doesn't block. The gate still fails, because the pass rate is below 95%.
 
-## Restore
+## Testing
 
-Replaces all n8n data with the backup. Change the file name to the backup you want:
+| Layer | Tests | What they check | Needs n8n |
+|---|---|---|---|
+| Static ([`test_workflow_files.py`](tests/test_workflow_files.py)) | 10 | Every connection points at a real node, every Code node's JavaScript parses, the webhooks match the documented API, every path through the gate ends in a response, no pinned test data | No |
+| End-to-end ([`test_quality_gate.py`](tests/test_quality_gate.py)) | 37 | Gate verdicts, new/still-failing/fixed classification, pass-rate threshold boundaries, flaky detection (flips, retries, per-branch history), pytest and Surefire reports, input validation, API-key checks, the Markdown summary | Yes |
+| End-to-end ([`test_dashboard.py`](tests/test_dashboard.py)) | 4 | Project list, project page, empty state, HTML escaping of values from reports | Yes |
 
-```powershell
-docker compose down -v
-docker compose create
-docker run --rm -v n8n_data:/n8n -v n8n_postgres_data:/postgres -v "${PWD}\backups:/backup" alpine tar xzf /backup/n8n-backup-2026-09-25.tar.gz -C /
-docker compose up -d
+Every test sends its results under its own project name, so tests don't depend on each other and can run against a shared instance. JUnit reports are built with a small helper ([`junit_builder.py`](tests/junit_builder.py)), plus realistic pytest and Maven Surefire fixtures.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate               # Windows: .venv\Scripts\activate
+pip install -r tests/requirements.txt
+pytest -m "not e2e"                     # static checks, no n8n needed
+pytest                                  # everything; needs the stack running and the workflows installed
 ```
 
-## Changing settings
+**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the static checks first, along with checks of `docker-compose.yml` and of the pipeline itself ([actionlint](https://github.com/rhysd/actionlint)), then the end-to-end job on a fresh stack. That job also checks the workflow files in the repo match what n8n stores (a workflow edited in the UI but not exported fails the build), and sends its own results through the gate so the verdict appears on the run's summary page.
 
-Edit `docker-compose.yml`, then run `docker compose up -d` to apply.
+**A bug the tests found:** with *On Error: Continue* turned on, n8n's XML node (n8n 2.40.7) puts the parser error in its input list instead of its output, so the error disappears and the workflow ends silently. A truncated report came back as an empty `200 OK`. The workflow now always emits an item from the XML node and checks the parse result itself, and three tests cover malformed XML.
 
-- **Open n8n from other devices on your network:** change the n8n port line to `"5678:5678"` and add `N8N_SECURE_COOKIE=false` under its `environment` (needed because the connection is plain http). Then browse to `http://<this PC's IP>:5678`.
-- **Receive webhooks from the internet:** run a tunnel (ngrok, Cloudflare Tunnel) and set `N8N_WEBHOOK_URL` to its public URL.
-- **Postgres login in `.env`:** these values only take effect when the database is first created, so changing them later breaks n8n's connection. To change the password, first run `ALTER USER n8n WITH PASSWORD 'new-password';` in Adminer (**SQL command**), then put the same value in `.env` and run `docker compose up -d`.
+## Project structure
 
-## Code nodes
+```
+workflows/              the two n8n workflows (import format)
+sql/schema.sql          tables for the qa_metrics database
+scripts/
+  create_env.py         creates .env with random secrets
+  install_workflows.py  sets up the database, credentials and workflows
+  export_workflows.py   writes workflows edited in n8n back to workflows/
+  publish_results.py    CI client: sends a report, prints the verdict
+  seed_demo_data.py     demo history for the dashboard
+tests/                  static and end-to-end tests, fixtures
+docker-compose.yml      n8n, Postgres 18, Adminer and the Code-node runners
+docs/operations.md      running the stack: backups, updates, Adminer, MCP
+```
 
-JavaScript and Python Code nodes run in the `n8n-runners` container. By default, n8n limits what their code can import:
+## Changing the workflows
 
-- JavaScript: only `crypto` and `moment`.
-- Python: nothing. For example, `import json` fails with "Import of standard library module 'json' is disallowed".
+Edit them in the n8n editor, then run `python scripts/export_workflows.py` and commit the changed files in `workflows/`. The export keeps only the fields that define a workflow, so files don't change because of timestamps or version IDs.
 
-Allowing more modules means replacing the runner's config file (`/etc/n8n-task-runners.json` in `n8n-runners`). See [n8n's task runner docs](https://docs.n8n.io/deploy/host-n8n/configure-n8n/set-up-task-runners).
+## Limitations
+
+- In CI the database starts empty on every run, so the dogfooding verdict has no history to compare against. Point `N8N_URL` at a long-running n8n to build up real trend data.
+- The dashboard has no login. Keep n8n on localhost or put it behind your own authentication before exposing it.
+- The flaky rule is a heuristic, and a test's identity is `classname::name`, so a renamed test starts a new history.
+
+## Running the stack
+
+Backups, restores, updates, Adminer, Code-node limits and connecting Claude Code over MCP are covered in [docs/operations.md](docs/operations.md).

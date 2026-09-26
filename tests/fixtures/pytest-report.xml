@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests">
+  <testsuite name="pytest" errors="1" failures="1" skipped="1" tests="6" time="2.612" timestamp="2026-09-26T10:15:02.123456+05:30" hostname="ci-runner">
+    <testcase classname="tests.api.test_users" name="test_create_user" time="0.412" />
+    <testcase classname="tests.api.test_users" name="test_get_user" time="0.118" />
+    <testcase classname="tests.api.test_users" name="test_delete_user" time="0.205">
+      <failure message="AssertionError: expected status 204, got 500">client = &lt;TestClient&gt;
+
+    def test_delete_user(client):
+        response = client.delete("/users/42")
+&gt;       assert response.status_code == 204, f"expected status 204, got {response.status_code}"
+E       AssertionError: expected status 204, got 500
+
+tests/api/test_users.py:31: AssertionError</failure>
+    </testcase>
+    <testcase classname="tests.api.test_orders" name="test_list_orders" time="1.873" />
+    <testcase classname="tests.api.test_orders" name="test_refund" time="0.004">
+      <error message="failed on setup with &quot;ConnectionError: payment sandbox unreachable&quot;">ConnectionError: payment sandbox unreachable</error>
+    </testcase>
+    <testcase classname="tests.api.test_orders" name="test_export_csv" time="0.000">
+      <skipped type="pytest.skip" message="export service is not deployed in CI">tests/api/test_orders.py:58: export service is not deployed in CI</skipped>
+    </testcase>
+  </testsuite>
+</testsuites>
